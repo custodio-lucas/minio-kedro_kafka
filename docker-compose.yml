@@ -1,0 +1,141 @@
+version: '3'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    ports:
+      - 2181:2181
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka-1:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-1
+    restart: always
+    depends_on:
+      - zookeeper
+    ports:
+      - 9092:9092
+      - 29092:29092
+    environment:
+      environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+  
+  minio:
+    container_name: minio
+    hostname: minio
+    depends_on:
+      - zookeeper
+    # create the server command and the set the api ip 
+    command: server --console-address ":9001" /data
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    image: minio/minio
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    
+  kafka-init:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - kafka-1
+    entrypoint: [ '/bin/sh', '-c' ]
+    command: |
+      "
+      kafka-topics --bootstrap-server kafka-1:9092 --list && \
+      kafka-topics --bootstrap-server kafka-1:9092 --create --if-not-exists --topic my-topic --replication-factor 1 --partitions 3 && \
+      kafka-topics --bootstrap-server kafka-1:9092 --list
+      "
+
+  init-minio:
+    container_name: init-minio
+    image: minio/mc
+    hostname: init-minio
+    restart: 'no'
+    environment:
+      MINIO_NOTIFY_KAFKA_ENABLE: "on"
+      MINIO_NOTIFY_KAFKA_BROKERS: kafka-1:9092
+      MINIO_NOTIFY_KAFKA_TOPIC: my-topic
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY : ${MINIO_ROOT_PASSWORD}
+    # create the server command and the set the api ip 
+    entrypoint: [ '/bin/sh', '-c' ]
+    command: |  
+        "
+        sleep 30
+        mc alias set myminio 'http://minio:9000/' $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD 
+        mc mb --ignore-existing myminio/my-bucket
+        mc admin config set myminio/ notify_kafka:update brokers='kafka-1:9092' topic='my-topic'
+        mc admin service restart myminio
+        mc event add myminio/my-bucket arn:minio:sqs::update:kafka --event 'put' --ignore-existing
+        mc event list myminio/my-bucket arn:minio:sqs::update:kafka
+        "
+    depends_on:
+      - minio
+      - kafka-1
+    volumes:
+      - ./data:/data:rw
+    
+  script-runner:
+    build:
+      context: .
+    container_name: script-runner
+    depends_on:
+      - kafka-1
+      - minio
+    environment:
+      KAFKA_TOPIC: 'my-topic'
+      KAFKA_SERVER: 'kafka-1:9092'
+      MINIO_ENDPOINT: 'minio:9000'
+      MINIO_ACCESS_KEY: '${MINIO_ROOT_USER}'
+      MINIO_SECRET_KEY: '${MINIO_ROOT_PASSWORD}'
+      MINIO_BUCKET_NAME: 'my-bucket'
+    volumes:
+      - ./data:/data
+      - ./extraction_scripts:/extraction_scripts
+    restart: 'no'
+    command: bash ./extraction_scripts/extract_data.sh
+
+  kafka-ui:
+    depends_on:
+      - zookeeper
+      - kafka-1
+    image: provectuslabs/kafka-ui
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    restart: always
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka-1:9092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+      # - KAFKA_CLUSTERS_0_READONLY=true
+      # - KAFKA_CLUSTERS_0_SCHEMAREGISTRY=http://schema-registry:8085
+      # - KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME=first
+      # - KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS=http://connector:8083
+      # - KAFKA_CLUSTERS_0_METRICS_PORT=9997
+
+  # kedro-pipeline:
+  #   depends_on:
+  #     - kafka-1
+  #     - zookeeper
+  #   build: 
+  #     context: .
+  #   container_name: kedro-pipeline
+  #   volumes:
+  #     - ./data:/data
+  #     - ./src:/src
+  #   restart: always
+  #   command: python src/kafka_kedro/pipeline.py

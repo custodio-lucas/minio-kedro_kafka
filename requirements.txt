@@ -1,0 +1,5 @@
+minio
+roboflow
+python-dotenv
+kedro
+confluent-kafka
